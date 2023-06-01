@@ -1,5 +1,3 @@
-// server index.js
-
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
@@ -7,18 +5,18 @@ import multiparty from 'multiparty';
 import path from 'path';
 import fse from 'fs-extra';
 
-interface MultipartyUploadConfig {
-  uploadDir: string;
-}
 const jsonParser = bodyParser.json();
 const urlencodedParser = bodyParser.urlencoded({ extended: false });
 const app = express();
-const HOSTNAME = 'http://127.0.0.1:8888';
 app.use(express.json());
 app.use(cors());
 // 1. 读你要改变的内容
 // 2. 创建需要改写的内容
 // 3.可读 pipe() 到 可写 readStream.pipe(writeStream);
+
+const UPLOAD_DIR = path.resolve(__dirname, '..', 'temporary');
+const extractExt = (filename: string) =>
+  filename.slice(filename.lastIndexOf('.'), filename.length);
 
 // 写入文件流
 const pipeStream = (path: any, writeStream: any) =>
@@ -37,22 +35,25 @@ const pipeStream = (path: any, writeStream: any) =>
     });
     readStream.pipe(writeStream);
   });
+
 // 合并切片
-const mergeFileChunk = async (filePath: any, filename: any, size: any) => {
-  const chunkDir = path.resolve(UPLOAD_DIR, 'chunkDir' + filename);
+const mergeFileChunk = async (
+  filePath: string,
+  fileHash: string,
+  size: number
+) => {
+  const chunkDir = path.resolve(UPLOAD_DIR, 'chunkDir' + fileHash);
   const chunkPaths = await fse.readdir(chunkDir);
   // 根据切片下标进行排序
   // 否则直接读取目录的获得的顺序会错乱
   chunkPaths.sort(
     (a, b) => parseInt(a.split('-')[1]) - parseInt(b.split('-')[1])
   );
-  console.log('chunkPaths', chunkPaths);
-
   // 并发写入文件
   await Promise.all(
     chunkPaths.map((chunkPath, index) =>
       pipeStream(
-        // chunkDir - 分片目录
+        // chunkDir - 分片目录/分片文件夹
         // chunkPath - 分片目录下的分片文件
         path.resolve(chunkDir, chunkPath),
         // 根据 size 在指定位置创建可写流
@@ -67,13 +68,9 @@ const mergeFileChunk = async (filePath: any, filename: any, size: any) => {
   fse.rmdirSync(chunkDir);
 };
 
-const UPLOAD_DIR = path.resolve(__dirname, '..', 'temporary');
 const multiparty_upload = function multiparty_upload(req: any) {
   return new Promise(async (resolve, reject) => {
     new multiparty.Form().parse(req, async (err, fields, files) => {
-      console.log('fields', fields);
-      console.log('files', files);
-
       if (err) {
         reject(err);
         return;
@@ -81,11 +78,10 @@ const multiparty_upload = function multiparty_upload(req: any) {
 
       const [chunk] = files.chunk;
       const [hash] = fields.hash;
-      const [filename] = fields.filename;
-      console.log('chunk', chunk);
+      const chunkFileName = hash.split('-')[0];
 
       // 切片文件夹名
-      const chunkDir = path.resolve(UPLOAD_DIR, 'chunkDir' + filename);
+      const chunkDir = path.resolve(UPLOAD_DIR, 'chunkDir' + chunkFileName);
 
       if (!fse.existsSync(chunkDir)) {
         await fse.mkdirs(chunkDir);
@@ -97,6 +93,7 @@ const multiparty_upload = function multiparty_upload(req: any) {
   });
 };
 
+// 文件上传
 app.post('/upload_single', async (req, res) => {
   try {
     await multiparty_upload(req);
@@ -112,15 +109,14 @@ app.post('/upload_single', async (req, res) => {
   }
 });
 
+// 通知是否进行文件合并
 app.post('/merge', async (req, res) => {
   try {
-    console.log('reqreqreqreq', req.body);
-    const { filename, size } = req.body || {};
+    const { filename, size, fileHash } = req.body || {};
+    const ext = extractExt(filename);
     // 是要合并的文件的最终位置
-    const filePath = path.resolve(UPLOAD_DIR, `${filename}`);
-    console.log('filePath', filePath);
-
-    await mergeFileChunk(filePath, filename, size);
+    const filePath = path.resolve(UPLOAD_DIR, `${fileHash}${ext}`);
+    await mergeFileChunk(filePath, fileHash, size);
     res.send({
       code: 0,
       message: 'file merged success',
@@ -129,6 +125,45 @@ app.post('/merge', async (req, res) => {
     res.send({
       code: 1,
       message: 'file merged failed',
+    });
+  }
+});
+
+// 返回已上传的所有切片名
+const createUploadedList = async (fileHash: string) => {
+  return fse.existsSync(path.resolve(UPLOAD_DIR, 'chunkDir' + fileHash))
+    ? await fse.readdir(path.resolve(UPLOAD_DIR, 'chunkDir' + fileHash))
+    : [];
+};
+
+// 确认文件是否上传过(秒传)
+app.post('/verify_upload', async (req, res) => {
+  try {
+    const { fileName, fileHash } = req.body;
+    const ext = extractExt(fileName);
+    const filePath = path.resolve(UPLOAD_DIR, `${fileHash}${ext}`);
+    // 文件是否已经合并, 服务端已存在该文件，不需要再次上传
+    if (fse.existsSync(filePath)) {
+      res.send({
+        code: 0,
+        shouldUpload: false,
+        message: 'has uploaded',
+      });
+    } else {
+      // 服务端不存在该文件或者已上传部分文件切片，通知前端进行上传，并把已上传的文件切片返回给前端
+      const uploadedList = await createUploadedList(fileHash);
+      res.send({
+        code: 1,
+        shouldUpload: true,
+        message: 'has not uploaded and reload',
+        uploadedList,
+      });
+    }
+  } catch (error) {
+    res.send({
+      code: 3,
+      shouldUpload: true,
+      message: 'error',
     });
   }
 });
